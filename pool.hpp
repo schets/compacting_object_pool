@@ -54,7 +54,7 @@ class base_compacting_pool {
     static inline size_t get_and_clear_first_set(size_t *dest) {
         size_t oldval = *dest;
         size_t rval = get_first_set(oldval);
-        // On haswell, one can use the clear-lowest-set instruction
+        // On haswell, one can use the clear-lowest-set instruction blsr
         // which only takes 1 cycle, would have no dependency on
         // get-first-set, and can execute on a different port.
         // (would require going from lowest bit to highest in other ops)
