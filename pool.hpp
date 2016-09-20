@@ -3,8 +3,8 @@
 
 #include <stddef.h>
 #include <stdint.h>
-
-
+#include <stdlib.h>
+#include "util.hpp"
 /// This is the base class for allocating objects of a certain size
 /// Parameters:
 ///     size: The size of each block being allocated
@@ -47,7 +47,7 @@ template<size_t size, size_t align>
 class base_compacting_pool {
 
     static inline size_t get_first_set(size_t val) {
-        __asm("bsf %1, %0" : "=r" (val) : "r" : (val) :);
+        __asm("bsf %1, %0" : "=r" (val) : "r" (val) :);
         return val;
     }
 
@@ -68,24 +68,24 @@ class base_compacting_pool {
         return val;
     }
 
-    struct dummmy_object {
-        alignas(align) union {
-            char data[size];
-            dummy_object *next;
-        }
+    struct dummy_object {
+        alignas(align) char data[size];
     };
 
+    constexpr static size_t bits_per_size = sizeof(size_t) * 8;
+    constexpr static size_t all_ones = (0 - 1);
+
     struct slab {
-        constexpr static size_t bits_per_size = sizeof(size_t) * 8;
         dummy_object members[bits_per_size];
         size_t open_bitmask;
+        slab *next, *prev; //maintaining a linked list in the slab pool
 
         bool is_empty() const { return open_bitmask == 0; }
 
-        size_t get_count() const { return __builtin_popcnt(open_bitmask); }
+        size_t get_count() const { return __builtin_popcount(open_bitmask); }
 
         dummy_object *get_object() {
-            return &members[get_and_clear_first_set(open_bitmask)];
+            return &members[get_and_clear_first_set(&open_bitmask)];
         }
 
         dummy_object *return_object(void *_obj) {
@@ -98,38 +98,121 @@ class base_compacting_pool {
         }
     };
 
-    void *held_buffer[256];
+    constexpr static size_t partial_slabs = 0;
+    constexpr static size_t full_slabs = 1;
+    constexpr static size_t retrieval_limit = 10;
+
     void *current;
-    size_t retrieved_streak;
+    uint32_t retrieve_streak;
     uint8_t stack_head;
 
-    void *try_get_obj() {
+
+    void *held_buffer[256];
+    slab *empty_slabs;
+    slab *data_slabs[2];
+
+    void *add_slab() {
+        slab *s = (slab *)malloc(sizeof(*s));
+        s->next = empty_slabs;
+        if (empty_slabs) empty_slabs->prev = s;
+        s->prev = nullptr;
+        s->open_bitmask = all_ones & (all_ones >> 1);
+        load_all(s);
+        return &s->members[0];
+    }
+
+    void *get_from_slab_list() {
+        size_t which_slabs = partial_slabs;
+        which_slabs ^= retrieve_streak > 11;
+        slab *tryit = data_slabs[which_slabs];
+        tryit = (tryit == nullptr) ? data_slabs[which_slabs ^ 1] : tryit;
+        if (unlikely(tryit == nullptr)) {
+            return nullptr;
+        }
+        void *rval = tryit->get_object();
+        load_all(tryit);
+        return rval;
+    }
+
+    template<bool do_malloc>
+    void *base_try_alloc() {
         void *rval = current;
-        ++retrieved_streak;
-        if (rval) {
+        if (likely(rval)) {
+            retrieve_streak = inc_if_below_max(retrieve_streak);
             current = held_buffer[stack_head];
             held_buffer[stack_head--] = nullptr;
             return rval;
         }
-
-        // add slab-management-code and bulk-load code here
-        return nullptr;
+        return OUT_OF_LINE({
+            void *rval = get_from_slab_list();
+            return !rval && do_malloc ? add_slab() : rval;
+            });
     }
 
-    void return_object(void *to_ret) {
+    void load_all(slab *s) {
+        uint64_t available_set = s->open_bitmask;
+        while(true) {
+            uint64_t index = get_and_clear_first_set(&available_set);
+            void *value = &s->members[index];
+            __builtin_prefetch(value, 1, 3);
+            if (available_set) {
+                held_buffer[++stack_head] = value;
+            }
+            else {
+                current = value;
+                break;
+            }
+        };
+    }
+
+public:
+    void *try_alloc() {
+        return base_try_alloc<false>();
+    }
+
+    void *alloc() {
+        return base_try_alloc<true>();
+    }
+
+    void free(void *to_ret) {
         void *to_write = current;
         current = to_ret;
-        retrieved_streak = 0;
-        if (current) {
+        if (likely(to_write)) {
+            retrieve_streak = dec_if_above_min(retrieve_streak);
             void *old_val = held_buffer[++stack_head];
-            held_buffer[stack_head] = current;
+            held_buffer[stack_head] = to_write;
             if (old_val) {
-                slab *s = slab::lookup_slab(old_val);
-                s->return_object(old_val);
-                // add some slab-management code here
+                OUT_OF_LINE({
+                        slab *s = slab::lookup_slab(old_val);
+                        bool was_empty = s->open_bitmask == 0;
+                        s->return_object(old_val);
+                        // empty slabs go to bottom of slab list
+                        // so that slabs evicted from the top are likely to be full
+                        if (unlikely(was_empty)) {
+                            //move slab from empty list to partial list
+                        }
+
+                        // full branches will go to top of list
+                        // since occupancy is all the same and there's
+                        // better cache properties
+                        if (unlikely(s->open_bitmask == all_ones)) {
+                            //move slab from partial to full list
+                        }
+                    });
             }
         }
     }
+
+    base_compacting_pool()
+        :
+        current(nullptr),
+        retrieve_streak(0),
+        stack_head(0),
+        empty_slabs(nullptr)
+        {
+            data_slabs[0] = nullptr;
+            data_slabs[1] = nullptr;
+        }
 };
 
 
