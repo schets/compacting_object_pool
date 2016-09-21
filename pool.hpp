@@ -58,14 +58,14 @@ class base_compacting_pool {
         // which only takes 1 cycle, would have no dependency on
         // get-first-set, and can execute on a different port.
         // (would require going from lowest bit to highest in other ops)
-        __asm("btc %1, %0" : "=r" (oldval) : "r" (rval) :);
+        __asm("btr %1, %0" : "=r" (oldval) : "r" (rval), "0" (oldval) :);
         *dest = oldval;
         return rval;
     }
 
     static inline size_t set_bit(size_t which, size_t val) {
-        __asm("bts %1, %0" : "=r" (val) : "r" (which) :);
-        return val;
+        __asm("bts %1, %0" : "=r" (which) : "r" (val), "0" (which) :);
+        return which;
     }
 
     struct dummy_object {
@@ -94,7 +94,7 @@ class base_compacting_pool {
         }
 
         static slab *lookup_slab(void *obj) {
-            return (slab *)((size_t)obj & 4096);
+            return (slab *)((size_t)obj & ~4095);
         }
     };
 
@@ -103,8 +103,10 @@ class base_compacting_pool {
     constexpr static size_t retrieval_limit = 10;
 
     void *current;
-    uint32_t retrieve_streak;
-    uint8_t stack_head;
+    uint32_t alloc_streak = 0;
+    uint32_t evict_streak = 0;
+    uint32_t load_streak = 0;
+    uint8_t stack_head = 0;
 
 
     void *held_buffer[256];
@@ -112,20 +114,22 @@ class base_compacting_pool {
     slab *data_slabs[2];
 
     void *add_slab() {
-        slab *s = (slab *)malloc(sizeof(*s));
+        slab *s;
+        posix_memalign((void **)&s, 64, sizeof(*s));
         s->next = empty_slabs;
         if (empty_slabs) empty_slabs->prev = s;
+        empty_slabs = s;
         s->prev = nullptr;
-        s->open_bitmask = all_ones & (all_ones >> 1);
+        s->open_bitmask = all_ones & ~1;
         load_all(s);
         return &s->members[0];
     }
 
     void *get_from_slab_list() {
         size_t which_slabs = partial_slabs;
-        which_slabs ^= retrieve_streak > 11;
         slab *tryit = data_slabs[which_slabs];
         tryit = (tryit == nullptr) ? data_slabs[which_slabs ^ 1] : tryit;
+        evict_streak = 0;
         if (unlikely(tryit == nullptr)) {
             return nullptr;
         }
@@ -137,16 +141,15 @@ class base_compacting_pool {
     template<bool do_malloc>
     void *base_try_alloc() {
         void *rval = current;
+        ++alloc_streak;
         if (likely(rval)) {
-            retrieve_streak = inc_if_below_max(retrieve_streak);
             current = held_buffer[stack_head];
             held_buffer[stack_head--] = nullptr;
             return rval;
-        }
-        return OUT_OF_LINE({
+        }{
             void *rval = get_from_slab_list();
             return !rval && do_malloc ? add_slab() : rval;
-            });
+        }
     }
 
     void load_all(slab *s) {
@@ -165,6 +168,24 @@ class base_compacting_pool {
         };
     }
 
+    static void remove_slab(slab *s, slab *& head) {
+        if (s->prev == s) {
+            head = nullptr;
+            s->prev = s->next = nullptr;
+            return;
+        }
+        if (s->prev) {
+            s->prev->next = s->next;
+        }
+        if (s->next) {
+            s->next->prev = s->prev;
+        }
+
+        if (s == head) {
+            head = s->next;
+        }
+    }
+
 public:
     void *try_alloc() {
         return base_try_alloc<false>();
@@ -178,40 +199,78 @@ public:
         void *to_write = current;
         current = to_ret;
         if (likely(to_write)) {
-            retrieve_streak = dec_if_above_min(retrieve_streak);
             void *old_val = held_buffer[++stack_head];
             held_buffer[stack_head] = to_write;
             if (old_val) {
-                OUT_OF_LINE({
+                // move common operations to a shared code space
+                        ++evict_streak;
                         slab *s = slab::lookup_slab(old_val);
                         bool was_empty = s->open_bitmask == 0;
                         s->return_object(old_val);
-                        // empty slabs go to bottom of slab list
-                        // so that slabs evicted from the top are likely to be full
-                        if (unlikely(was_empty)) {
-                            //move slab from empty list to partial list
-                        }
+                        bool val = s->open_bitmask == all_ones;
+                        val |= was_empty;
 
-                        // full branches will go to top of list
-                        // since occupancy is all the same and there's
-                        // better cache properties
-                        if (unlikely(s->open_bitmask == all_ones)) {
-                            //move slab from partial to full list
+                        // Only have one branch on the main path
+                        if (unlikely(val != 0)) {
+
+                            // empty slabs go to bottom of slab list
+                            // so that slabs evicted from the top are likely to be full
+                            // move slab from empty list to partial list
+                            if (was_empty) {
+                                remove_slab(s, empty_slabs);
+                                slab *partial = data_slabs[partial_slabs];
+                                if (partial) {
+                                    s->prev = partial->prev;
+                                    s->next = partial;
+                                    partial->prev = s;
+                                    if (s->prev) {
+                                        s->prev->next = s;
+                                    }
+                                }
+                                else {
+                                    s->prev = s->next = nullptr;
+                                    data_slabs[partial_slabs] = s;
+                                }
+                            }
+                            // full branches will go to top of list
+                            // since occupancy is all the same and there's
+                            // better cache properties
+                            else {
+                                remove_slab(s, data_slabs[partial_slabs]);
+                                s->prev = nullptr;
+                                slab *full = data_slabs[full_slabs];
+                                s->next = full;
+                                if (full) {
+                                    full->prev = s;
+                                }
+                                data_slabs[full_slabs] = s;
+                            }
                         }
-                    });
             }
+        }
+    }
+
+    void clean() {
+        slab *f = data_slabs[full_slabs];
+        data_slabs[full_slabs] = nullptr;
+        while(f) {
+            slab *tofree = f;
+            remove_slab(f, f);
+            ::free(tofree);
         }
     }
 
     base_compacting_pool()
         :
         current(nullptr),
-        retrieve_streak(0),
         stack_head(0),
         empty_slabs(nullptr)
         {
             data_slabs[0] = nullptr;
             data_slabs[1] = nullptr;
+            for (int i = 0; i < 256; i++) {
+                held_buffer[i] = nullptr;
+            }
         }
 };
 
