@@ -5,6 +5,7 @@
 #include <stdint.h>
 #include <stdlib.h>
 #include <assert.h>
+#include <unordered_set>
 #include "util.hpp"
 /// This is the base class for allocating objects of a certain size
 /// Parameters:
@@ -104,6 +105,8 @@ template <size_t size, size_t align> class base_compacting_pool {
   uint32_t load_streak = 0;
   uint8_t stack_head = 0;
 
+  std::unordered_set<void *> alloced;
+
   void* held_buffer[256];
   slab* empty_slabs;
   slab* data_slabs[2];
@@ -118,18 +121,9 @@ template <size_t size, size_t align> class base_compacting_pool {
       empty_slabs->prev = s;
     empty_slabs = s;
     s->prev = nullptr;
-    s->open_bitmask = 0;
+    s->open_bitmask = (0 - 1) ^ 1;
     // only called when empty!
-    stack_head = 61;
-    __asm("nop\n\t nop\n\t nop\n\t nop\n\t");
-    for (uint8_t temp_head = 63; temp_head > 1; temp_head -= 2) {
-      held_buffer[temp_head - 2] = s->members + temp_head;
-      held_buffer[temp_head - 3] = s->members + temp_head - 1;
-    }
-    __asm("nop\n\t nop\n\t nop\n\t nop\n\t");
-    assert(held_buffer[61] != nullptr);
-    assert(held_buffer[62] == nullptr);
-    current = s->members + 1;
+    load_all(s);
     return s->members;
   }
 
@@ -165,6 +159,7 @@ template <size_t size, size_t align> class base_compacting_pool {
   void load_all(slab* s) {
     uint64_t available_set = s->open_bitmask;
     s->open_bitmask = 0;
+    assert(available_set);
     while (true) {
       uint64_t index = get_and_clear_first_set(&available_set);
       void* value = &s->members[index];
@@ -254,11 +249,17 @@ public:
     }
   }
 
-  void* try_alloc() { return base_try_alloc<false>(); }
+  void* alloc() { void *rval = base_try_alloc<true>();
+    if (alloced.find(rval) != alloced.end()) assert(false);
+    alloced.insert(rval);
+    return rval;
+  }
 
-  __attribute__((noinline)) void* alloc() { return base_try_alloc<true>(); }
+  __attribute__((noinline)) void* try_alloc() { return base_try_alloc<false>(); }
 
   __attribute__((noinline)) void free(void* to_ret) {
+    if (alloced.find(to_ret) == alloced.end()) assert(false);
+    alloced.erase(to_ret);
     void* to_write = current;
     current = to_ret;
     if (likely(to_write)) {
