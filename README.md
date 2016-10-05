@@ -21,3 +21,4 @@ A secondary advantage is that bulk-loading from a slab into the cache is
 each loop iteration ony depends on the value of the bitmask and not on
 loads from a possibly uncached linked list of usable objects.
 
+On one microbenchmark, this shows a 2x performance improvement for a large data size, although shows a small penalty when all the data fits in the L1 cache.
