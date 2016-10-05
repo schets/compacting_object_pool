@@ -7,6 +7,11 @@
 #include <assert.h>
 #include <unordered_set>
 #include "util.hpp"
+
+
+extern "C" {
+    #include "single_list.h"
+}
 /// This is the base class for allocating objects of a certain size
 /// Parameters:
 ///     size: The size of each block being allocated
@@ -44,6 +49,7 @@ template <size_t size, size_t align> class base_compacting_pool {
 
   static inline size_t get_and_clear_first_set(size_t* dest) {
     size_t oldval = *dest;
+    assert(oldval > 0);
     size_t rval = get_first_set(oldval);
     assert(rval < 64);
     // On haswell, one can use the clear-lowest-set instruction blsr
@@ -105,8 +111,6 @@ template <size_t size, size_t align> class base_compacting_pool {
   uint32_t load_streak = 0;
   uint8_t stack_head = 0;
 
-  std::unordered_set<void *> alloced;
-
   void* held_buffer[256];
   slab* empty_slabs;
   slab* data_slabs[2];
@@ -130,7 +134,7 @@ template <size_t size, size_t align> class base_compacting_pool {
   void* get_from_slab_list() {
     size_t which_slabs = partial_slabs;
     slab* tryit = data_slabs[which_slabs];
-    tryit = (tryit == nullptr) ? data_slabs[which_slabs ^ 1] : tryit;
+    tryit = (tryit == nullptr) ? data_slabs[which_slabs ^= 1] : tryit;
     // evict_streak = 0;
     if (unlikely(tryit == nullptr)) {
       return nullptr;
@@ -138,6 +142,12 @@ template <size_t size, size_t align> class base_compacting_pool {
     void* rval = tryit->get_object();
     if (tryit->open_bitmask) load_all(tryit);
     //evict to empty region!
+    remove_slab(tryit, data_slabs[which_slabs]);
+    if (empty_slabs) {
+      empty_slabs->prev = tryit;
+    }
+    tryit->next = empty_slabs;
+    empty_slabs = tryit;
     assert(tryit->open_bitmask == 0);
     return rval;
   }
@@ -193,7 +203,7 @@ template <size_t size, size_t align> class base_compacting_pool {
 
   void evict_item(void* old_val) {
     // move common operations to a shared code space
-    //    ++evict_streak;
+    ++evict_streak;
     slab* s = slab::lookup_slab(old_val);
     bool was_empty = s->open_bitmask == 0;
     s->return_object(old_val);
@@ -249,17 +259,11 @@ public:
     }
   }
 
-  void* alloc() { void *rval = base_try_alloc<true>();
-    if (alloced.find(rval) != alloced.end()) assert(false);
-    alloced.insert(rval);
-    return rval;
-  }
+  void* alloc() { return base_try_alloc<true>(); }
 
   __attribute__((noinline)) void* try_alloc() { return base_try_alloc<false>(); }
 
   __attribute__((noinline)) void free(void* to_ret) {
-    if (alloced.find(to_ret) == alloced.end()) assert(false);
-    alloced.erase(to_ret);
     void* to_write = current;
     current = to_ret;
     if (likely(to_write)) {

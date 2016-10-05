@@ -5,11 +5,12 @@
 #include <algorithm>
 #include <iostream>
 
+static unfixed_block single_alloc = create_unfixed_block(sizeof(tree), 64);
 constexpr static size_t size_middle = 16000000 / sizeof(tree);
 int32_t num_elems = 0;
 int randn[2049];
 size_t at = 0;
-int32_t num_go = 65000;
+int32_t num_go = 65000*2*2*2;
 
 using namespace std;
 __attribute__ ((noinline)) tree *alloc_tree(base_compacting_pool<16, 8> &pool) {
@@ -19,7 +20,9 @@ __attribute__ ((noinline)) tree *alloc_tree(base_compacting_pool<16, 8> &pool) {
 tree *build_tree(base_compacting_pool<16, 8> &pool, int depth, int maxdepth) {
     if (depth >= maxdepth) return nullptr;
     ++num_elems;
-    tree * volatile to_make = (tree *)pool.alloc();
+    //tree * volatile to_make = (tree *)malloc(sizeof(tree));
+    //tree * volatile to_make = (tree *)pool.alloc();
+    tree * volatile to_make = (tree *)block_alloc(&single_alloc);
     to_make->right = build_tree(pool, depth+1, maxdepth);
     to_make->left = build_tree(pool, depth+1, maxdepth);
     return (tree *)to_make;
@@ -30,7 +33,9 @@ void free_tree(base_compacting_pool<16, 8> &pool, tree *&root) {
     --num_elems;
     free_tree(pool, root->right);
     free_tree(pool, root->left);
-    pool.free(root);
+    //pool.free(root);
+    //free(root);
+    block_free(&single_alloc, root);
     root = nullptr;
 }
 
@@ -39,7 +44,7 @@ static inline char getnext() {
     return randn[at++ & 2047];
 }
 
-void iter_down(base_compacting_pool<16, 8> &pool,tree *&root, int32_t value, int delete_at, int depth, bool addit) {
+__attribute__ ((noinline)) void iter_down(base_compacting_pool<16, 8> &pool,tree *&root, int32_t value, int delete_at, int depth, bool addit) {
     int which_one = value & 1;
     if (root == nullptr) {
         if (addit) {
@@ -85,8 +90,9 @@ void modify_tree(base_compacting_pool<16, 8> &pool, tree *&root, int numdo) {
 int main() {
     srand(100);
     base_compacting_pool<16, 8> pool;
-    tree *t = build_tree(pool, 0, 16);
+    tree *t = build_tree(pool, 0, 19);
     modify_tree(pool, t, 0);
     free_tree(pool, t);
     pool.clean();
+    destroy_unfixed_block(&single_alloc);
 }
