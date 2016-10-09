@@ -4,14 +4,10 @@
 #include <stddef.h>
 #include <stdint.h>
 #include <stdlib.h>
-#include <assert.h>
-#include <unordered_set>
 #include "util.hpp"
 
+#define assert(x)
 
-extern "C" {
-    #include "single_list.h"
-}
 /// This is the base class for allocating objects of a certain size
 /// Parameters:
 ///     size: The size of each block being allocated
@@ -40,62 +36,28 @@ extern "C" {
 /// A secondary advantage is that bulk-loading from a slab into the cache is
 /// each loop iteration ony depends on the value of the bitmask and not on
 /// loads from a possibly uncached linked list of usable objects.
-template <size_t size, size_t align> class base_compacting_pool {
-
-  static inline size_t get_first_set(size_t val) {
-    __asm("bsf %1, %0" : "=r"(val) : "r"(val) :);
-    return val;
-  }
-
-  static inline size_t get_and_clear_first_set(size_t* dest) {
-    size_t oldval = *dest;
-    assert(oldval > 0);
-    size_t rval = get_first_set(oldval);
-    assert(rval < 64);
-    // On haswell, one can use the clear-lowest-set instruction blsr
-    // which only takes 1 cycle, would have no dependency on
-    // get-first-set, and can execute on a different port.
-    __asm("btr %1, %0" : "=r"(oldval) : "r"(rval), "0"(oldval) :);
-    assert((oldval & ((size_t)1 << rval)) == 0);
-    *dest = oldval;
-    return rval;
-  }
-
-  static inline size_t set_bit(size_t which, size_t val) {
-    assert(val < 64);
-    assert((which & ((size_t)1 << val)) == 0);
-    __asm("bts %1, %0" : "=r"(which) : "r"(val), "0"(which) :);
-    assert((which & ((size_t)1 << val)) != 0);
-    return which;
-  }
+template <size_t size, size_t align, size_t nbits=1>
+class base_compacting_pool {
 
   struct dummy_object {
     alignas(align) char data[size];
   };
 
-  constexpr static size_t bits_per_size = sizeof(size_t) * 8;
+  constexpr static size_t bits_per_size = sizeof(size_t) * 8 * nbits;
   constexpr static size_t all_ones = (0 - 1);
+  constexpr static size_t index_mask = nbits / 2;
 
   struct slab {
-    dummy_object members[bits_per_size];
-    size_t open_bitmask;
+    dummy_object members[nbits];
+    size_t open_bitmask[nbits];
     slab* next, *prev; // maintaining a linked list in the slab pool
-
-    bool is_empty() const { return open_bitmask == 0; }
-
-    size_t get_count() const { return __builtin_popcount(open_bitmask); }
-
-    dummy_object* get_object() {
-      dummy_object* obj = &members[get_and_clear_first_set(&open_bitmask)];
-      assert(obj >= members && obj <= &members[63]);
-      return obj;
-    }
 
     dummy_object* return_object(void* _obj) {
       dummy_object* obj = (dummy_object*)_obj;
-      assert(obj >= members && obj <= &members[63]);
-      open_bitmask = set_bit(open_bitmask, obj - &members[0]);
-      assert(open_bitmask != 0);
+      uint32_t index = obj - &members[0];
+      uint32_t which_mask = index & index_mask;
+      uint32_t bit_index = index >> index_mask;
+      open_bitmask = set_bit(open_bitmask[which_mask], bit_index);
     }
 
     static slab* lookup_slab(void* obj) { return (slab*)((size_t)obj & ~4095); }
@@ -152,19 +114,7 @@ template <size_t size, size_t align> class base_compacting_pool {
     return rval;
   }
 
-  template <bool do_malloc> void* base_try_alloc() {
-    void* rval = current;
-    ++alloc_streak;
-    if (likely(rval)) {
-      current = held_buffer[stack_head];
-      held_buffer[stack_head--] = nullptr;
-      return rval;
-    }
-    {
-      void* rval = get_from_slab_list();
-      return !rval && do_malloc ? add_slab() : rval;
-    }
-  }
+
 
   void load_all(slab* s) {
     uint64_t available_set = s->open_bitmask;
@@ -247,60 +197,100 @@ template <size_t size, size_t align> class base_compacting_pool {
     }
   }
 
+  static void clean_slab_list(slab*& _s);
+
+  template <bool do_malloc> void* base_try_alloc();
+
 public:
-  void clear_cache() {
-    uint8_t head = stack_head;
-    stack_head = 0;
-    if (current)
-      evict_item(current);
-    while (held_buffer[head]) {
-      evict_item(held_buffer[head]);
-      held_buffer[head--] = nullptr;
-    }
-  }
 
   void* alloc() { return base_try_alloc<true>(); }
 
-  __attribute__((noinline)) void* try_alloc() { return base_try_alloc<false>(); }
+  void* try_alloc() { return base_try_alloc<false>(); }
 
-  __attribute__((noinline)) void free(void* to_ret) {
-    void* to_write = current;
-    current = to_ret;
-    if (likely(to_write)) {
-      void* old_val = held_buffer[++stack_head];
-      held_buffer[stack_head] = to_write;
-      if (old_val)
-        evict_item(old_val);
-    }
-  }
+  void clear_cache();
 
-  static void cleanit(slab*& _s) {
-    slab* s = _s;
-    _s = nullptr;
-    while (s) {
-      slab* tofree = s;
-      remove_slab(s, s);
-      ::free(tofree);
-    }
-  }
-  void clean() { cleanit(data_slabs[full_slabs]); }
 
-  base_compacting_pool()
-    : current(nullptr), stack_head(0), empty_slabs(nullptr) {
-    data_slabs[0] = nullptr;
-    data_slabs[1] = nullptr;
-    for (int i = 0; i < 256; i++) {
-      held_buffer[i] = nullptr;
-    }
-  }
+  void free(void* to_ret);
 
-  ~base_compacting_pool() {
-    clear_cache();
-    cleanit(empty_slabs);
-    cleanit(data_slabs[partial_slabs]);
-    cleanit(data_slabs[full_slabs]);
-  }
+
+  void clean() { clean_slab_list(data_slabs[full_slabs]); }
+
+  base_compacting_pool();
+  ~base_compacting_pool();
+
 };
+
+
+template<size_t s, size_t a, size_t n>
+base_compacting_pool<s, a, n>::base_compacting_pool()
+  : current(nullptr), stack_head(0), empty_slabs(nullptr) {
+  data_slabs[0] = nullptr;
+  data_slabs[1] = nullptr;
+  for (auto& ptr : held_buffer) ptr = nullptr;
+}
+
+template<size_t s, size_t a, size_t n>
+base_compacting_pool<s, a, n>::~base_compacting_pool() {
+  clear_cache();
+  clean_slab_list(empty_slabs);
+  clean_slab_list(data_slabs[partial_slabs]);
+  clean_slab_list(data_slabs[full_slabs]);
+}
+
+
+template<size_t si, size_t a, size_t n>
+void base_compacting_pool<si, a, n>::clean_slab_list(slab*& _s) {
+  slab* s = _s;
+  _s = nullptr;
+  while (s) {
+    slab* tofree = s;
+    remove_slab(s, s);
+    ::free(tofree);
+  }
+}
+
+template<size_t si, size_t a, size_t n>
+template<bool do_malloc>
+void *base_compacting_pool<si, a, n>::base_try_alloc() {
+  void* rval = current;
+  ++alloc_streak;
+  if (likely(rval)) {
+    current = held_buffer[stack_head];
+    held_buffer[stack_head--] = nullptr;
+    return rval;
+  }
+  {
+    void* slabval = get_from_slab_list();
+    return !slabval && do_malloc ? add_slab() : slabval;
+  }
+}
+
+template<size_t si, size_t a, size_t n>
+void base_compacting_pool<si, a, n>::free(void *to_ret) {
+  void* to_write = current;
+  current = to_ret;
+  if (likely(to_write)) {
+    void* old_val = held_buffer[++stack_head];
+    held_buffer[stack_head] = to_write;
+    if (old_val)
+      evict_item(old_val);
+  }
+}
+
+
+
+template<size_t si, size_t a, size_t n>
+void base_compacting_pool<si, a, n>::clear_cache() {
+  uint8_t head = stack_head;
+  stack_head = 0;
+  if (current)
+    evict_item(current);
+  while (held_buffer[head]) {
+    evict_item(held_buffer[head]);
+    held_buffer[head--] = nullptr;
+  }
+}
+
 
 /// For global type_based pools, allows segregation
 /// of a type from other pools with objects of the same size
