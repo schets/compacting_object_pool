@@ -36,4 +36,10 @@ static inline size_t set_bit(size_t which, size_t val) {
     return which;
   }
 
+static inline void set_bit_mem(size_t *which, size_t val) {
+    assert(val < 64);
+    assert((*which & ((size_t)1 << val)) == 0);
+    __asm("bts %1, %0" : "=m"(*which) : "r"(val) :);
+    assert((*which & ((size_t)1 << val)) != 0);
+}
 #endif

@@ -36,28 +36,29 @@
 /// A secondary advantage is that bulk-loading from a slab into the cache is
 /// each loop iteration ony depends on the value of the bitmask and not on
 /// loads from a possibly uncached linked list of usable objects.
-template <size_t size, size_t align, size_t nbits=1>
+template <size_t size, size_t align>
 class base_compacting_pool {
 
   struct dummy_object {
     alignas(align) char data[size];
   };
 
-  constexpr static size_t bits_per_size = sizeof(size_t) * 8 * nbits;
+  constexpr static size_t bits_per_size = sizeof(size_t) * 8;
   constexpr static size_t all_ones = (0 - 1);
-  constexpr static size_t index_mask = nbits / 2;
 
   struct slab {
-    dummy_object members[nbits];
-    size_t open_bitmask[nbits];
-    slab* next, *prev; // maintaining a linked list in the slab pool
+    dummy_object members[bits_per_size];
+    size_t open_bitmask;
+    slab* next, *prev;
+
+    dummy_object* get_object() {
+      dummy_object* obj = &members[get_and_clear_first_set(&open_bitmask)];
+      return obj;
+    }
 
     dummy_object* return_object(void* _obj) {
       dummy_object* obj = (dummy_object*)_obj;
-      uint32_t index = obj - &members[0];
-      uint32_t which_mask = index & index_mask;
-      uint32_t bit_index = index >> index_mask;
-      open_bitmask = set_bit(open_bitmask[which_mask], bit_index);
+      open_bitmask = set_bit(open_bitmask, obj - &members[0]);
     }
 
     static slab* lookup_slab(void* obj) { return (slab*)((size_t)obj & ~4095); }
@@ -77,7 +78,7 @@ class base_compacting_pool {
   slab* empty_slabs;
   slab* data_slabs[2];
 
-  __attribute__((noinline)) void* add_slab() {
+  void* add_slab() {
     slab* s;
     if (posix_memalign((void**)&s, 4096, sizeof(*s))) {
       return nullptr;
@@ -93,45 +94,11 @@ class base_compacting_pool {
     return s->members;
   }
 
-  void* get_from_slab_list() {
-    size_t which_slabs = partial_slabs;
-    slab* tryit = data_slabs[which_slabs];
-    tryit = (tryit == nullptr) ? data_slabs[which_slabs ^= 1] : tryit;
-    // evict_streak = 0;
-    if (unlikely(tryit == nullptr)) {
-      return nullptr;
-    }
-    void* rval = tryit->get_object();
-    if (tryit->open_bitmask) load_all(tryit);
-    //evict to empty region!
-    remove_slab(tryit, data_slabs[which_slabs]);
-    if (empty_slabs) {
-      empty_slabs->prev = tryit;
-    }
-    tryit->next = empty_slabs;
-    empty_slabs = tryit;
-    assert(tryit->open_bitmask == 0);
-    return rval;
-  }
+  void* get_from_slab_list();
 
 
 
-  void load_all(slab* s) {
-    uint64_t available_set = s->open_bitmask;
-    s->open_bitmask = 0;
-    assert(available_set);
-    while (true) {
-      uint64_t index = get_and_clear_first_set(&available_set);
-      void* value = &s->members[index];
-      *(volatile uint32_t*)value;
-      if (available_set) {
-        held_buffer[++stack_head] = value;
-      } else {
-        current = value;
-        break;
-      }
-    };
-  }
+  void load_all(slab* s);
 
   static void remove_slab(slab* s, slab*& head) {
     if (s->prev == s) {
@@ -151,51 +118,7 @@ class base_compacting_pool {
     }
   }
 
-  void evict_item(void* old_val) {
-    // move common operations to a shared code space
-    ++evict_streak;
-    slab* s = slab::lookup_slab(old_val);
-    bool was_empty = s->open_bitmask == 0;
-    s->return_object(old_val);
-    bool val = s->open_bitmask == all_ones;
-    val |= was_empty;
-
-    // Only have one branch on the main path
-    if (unlikely(val != 0)) {
-
-      // empty slabs go to bottom of slab list
-      // so that slabs evicted from the top are likely to be full
-      // move slab from empty list to partial list
-      if (was_empty) {
-        remove_slab(s, empty_slabs);
-        slab* partial = data_slabs[partial_slabs];
-        if (partial) {
-          s->prev = partial->prev;
-          s->next = partial;
-          partial->prev = s;
-          if (s->prev) {
-            s->prev->next = s;
-          }
-        } else {
-          s->prev = s->next = nullptr;
-          data_slabs[partial_slabs] = s;
-        }
-      }
-      // full branches will go to top of list
-      // since occupancy is all the same and there's
-      // better cache properties
-      else {
-        remove_slab(s, data_slabs[partial_slabs]);
-        s->prev = nullptr;
-        slab* full = data_slabs[full_slabs];
-        s->next = full;
-        if (full) {
-          full->prev = s;
-        }
-        data_slabs[full_slabs] = s;
-      }
-    }
-  }
+  void evict_item(void *val);
 
   static void clean_slab_list(slab*& _s);
 
@@ -221,16 +144,16 @@ public:
 };
 
 
-template<size_t s, size_t a, size_t n>
-base_compacting_pool<s, a, n>::base_compacting_pool()
+template<size_t s, size_t a>
+base_compacting_pool<s, a>::base_compacting_pool()
   : current(nullptr), stack_head(0), empty_slabs(nullptr) {
   data_slabs[0] = nullptr;
   data_slabs[1] = nullptr;
   for (auto& ptr : held_buffer) ptr = nullptr;
 }
 
-template<size_t s, size_t a, size_t n>
-base_compacting_pool<s, a, n>::~base_compacting_pool() {
+template<size_t s, size_t a>
+base_compacting_pool<s, a>::~base_compacting_pool() {
   clear_cache();
   clean_slab_list(empty_slabs);
   clean_slab_list(data_slabs[partial_slabs]);
@@ -238,8 +161,8 @@ base_compacting_pool<s, a, n>::~base_compacting_pool() {
 }
 
 
-template<size_t si, size_t a, size_t n>
-void base_compacting_pool<si, a, n>::clean_slab_list(slab*& _s) {
+template<size_t si, size_t a>
+void base_compacting_pool<si, a>::clean_slab_list(slab*& _s) {
   slab* s = _s;
   _s = nullptr;
   while (s) {
@@ -249,9 +172,9 @@ void base_compacting_pool<si, a, n>::clean_slab_list(slab*& _s) {
   }
 }
 
-template<size_t si, size_t a, size_t n>
+template<size_t si, size_t a>
 template<bool do_malloc>
-void *base_compacting_pool<si, a, n>::base_try_alloc() {
+void *base_compacting_pool<si, a>::base_try_alloc() {
   void* rval = current;
   ++alloc_streak;
   if (likely(rval)) {
@@ -265,8 +188,8 @@ void *base_compacting_pool<si, a, n>::base_try_alloc() {
   }
 }
 
-template<size_t si, size_t a, size_t n>
-void base_compacting_pool<si, a, n>::free(void *to_ret) {
+template<size_t si, size_t a>
+void base_compacting_pool<si, a>::free(void *to_ret) {
   void* to_write = current;
   current = to_ret;
   if (likely(to_write)) {
@@ -277,10 +200,8 @@ void base_compacting_pool<si, a, n>::free(void *to_ret) {
   }
 }
 
-
-
-template<size_t si, size_t a, size_t n>
-void base_compacting_pool<si, a, n>::clear_cache() {
+template<size_t si, size_t a>
+void base_compacting_pool<si, a>::clear_cache() {
   uint8_t head = stack_head;
   stack_head = 0;
   if (current)
@@ -291,6 +212,92 @@ void base_compacting_pool<si, a, n>::clear_cache() {
   }
 }
 
+template<size_t si, size_t a>
+void base_compacting_pool<si, a>::evict_item(void* old_val) {
+  // move common operations to a shared code space
+  ++evict_streak;
+  slab* s = slab::lookup_slab(old_val);
+  bool was_empty = s->open_bitmask == 0;
+  s->return_object(old_val);
+  bool val = s->open_bitmask == all_ones;
+  val |= was_empty;
+
+  // Only have one branch on the main path
+  if (unlikely(val != 0)) {
+
+    // empty slabs go to bottom of slab list
+    // so that slabs evicted from the top are likely to be full
+    // move slab from empty list to partial list
+    if (was_empty) {
+      remove_slab(s, empty_slabs);
+      slab* partial = data_slabs[partial_slabs];
+      if (partial) {
+        s->prev = partial->prev;
+        s->next = partial;
+        partial->prev = s;
+        if (s->prev) {
+          s->prev->next = s;
+        }
+      } else {
+        s->prev = s->next = nullptr;
+        data_slabs[partial_slabs] = s;
+      }
+    }
+    // full branches will go to top of list
+    // since occupancy is all the same and there's
+    // better cache properties
+    else {
+      remove_slab(s, data_slabs[partial_slabs]);
+      s->prev = nullptr;
+      slab* full = data_slabs[full_slabs];
+      s->next = full;
+      if (full) {
+        full->prev = s;
+      }
+      data_slabs[full_slabs] = s;
+    }
+  }
+}
+
+template<size_t si, size_t a>
+void *base_compacting_pool<si, a>::get_from_slab_list() {
+  size_t which_slabs = partial_slabs;
+  slab* tryit = data_slabs[which_slabs];
+  tryit = (tryit == nullptr) ? data_slabs[which_slabs ^= 1] : tryit;
+  // evict_streak = 0;
+  if (unlikely(tryit == nullptr)) {
+    return nullptr;
+  }
+  void* rval = tryit->get_object();
+  if (tryit->open_bitmask) load_all(tryit);
+  //evict to empty region!
+  remove_slab(tryit, data_slabs[which_slabs]);
+  if (empty_slabs) {
+    empty_slabs->prev = tryit;
+  }
+  tryit->next = empty_slabs;
+  empty_slabs = tryit;
+  assert(tryit->open_bitmask == 0);
+  return rval;
+}
+
+template<size_t si, size_t a>
+void base_compacting_pool<si, a>::load_all(slab *s) {
+  uint64_t available_set = s->open_bitmask;
+  s->open_bitmask = 0;
+  assert(available_set);
+  while (true) {
+    uint64_t index = get_and_clear_first_set(&available_set);
+    void* value = &s->members[index];
+    *(volatile uint32_t*)value;
+    if (available_set) {
+      held_buffer[++stack_head] = value;
+    } else {
+      current = value;
+      break;
+    }
+  };
+}
 
 /// For global type_based pools, allows segregation
 /// of a type from other pools with objects of the same size
