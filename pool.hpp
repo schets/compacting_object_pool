@@ -213,7 +213,7 @@ void base_compacting_pool<si, a>::clear_cache() {
 }
 
 template<size_t si, size_t a>
-void base_compacting_pool<si, a>::evict_item(void* old_val) {
+__attribute__ ((noinline)) void base_compacting_pool<si, a>::evict_item(void* old_val) {
   // move common operations to a shared code space
   ++evict_streak;
   slab* s = slab::lookup_slab(old_val);
