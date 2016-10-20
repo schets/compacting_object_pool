@@ -39,6 +39,20 @@
 template <size_t size, size_t align>
 class base_compacting_pool {
 
+  struct small_index {
+    small_index(uint32_t v) : val(v) {}
+    uint32_t val;
+    constexpr static size_t mask = 63;
+    void inc() {
+      val = (val + 1) & mask;
+    }
+
+    void dec() {
+      val = (val - 1) & mask;
+    }
+
+  };
+
   struct dummy_object {
     alignas(align) char data[size];
   };
@@ -72,7 +86,7 @@ class base_compacting_pool {
   uint32_t alloc_streak = 0;
   uint32_t evict_streak = 0;
   uint32_t load_streak = 0;
-  uint8_t stack_head = 0;
+  small_index stack_head = 0;
 
   void* held_buffer[256];
   slab* empty_slabs;
@@ -178,8 +192,9 @@ void *base_compacting_pool<si, a>::base_try_alloc() {
   void* rval = current;
   ++alloc_streak;
   if (likely(rval)) {
-    current = held_buffer[stack_head];
-    held_buffer[stack_head--] = nullptr;
+    current = held_buffer[stack_head.val];
+    held_buffer[stack_head.val] = nullptr;
+    stack_head.dec();
     return rval;
   }
   {
@@ -193,8 +208,9 @@ void base_compacting_pool<si, a>::free(void *to_ret) {
   void* to_write = current;
   current = to_ret;
   if (likely(to_write)) {
-    void* old_val = held_buffer[++stack_head];
-    held_buffer[stack_head] = to_write;
+    stack_head.inc();
+    void* old_val = held_buffer[stack_head.val];
+    held_buffer[stack_head.val] = to_write;
     if (old_val)
       evict_item(old_val);
   }
@@ -202,13 +218,14 @@ void base_compacting_pool<si, a>::free(void *to_ret) {
 
 template<size_t si, size_t a>
 void base_compacting_pool<si, a>::clear_cache() {
-  uint8_t head = stack_head;
-  stack_head = 0;
+  small_index head = stack_head.val;
+  stack_head.val = 0;
   if (current)
     evict_item(current);
-  while (held_buffer[head]) {
-    evict_item(held_buffer[head]);
-    held_buffer[head--] = nullptr;
+  while (held_buffer[head.val]) {
+    evict_item(held_buffer[head.val]);
+    held_buffer[head.val] = nullptr;
+    head.dec();
   }
 }
 
@@ -291,7 +308,8 @@ void base_compacting_pool<si, a>::load_all(slab *s) {
     void* value = &s->members[index];
     *(volatile uint32_t*)value;
     if (available_set) {
-      held_buffer[++stack_head] = value;
+      stack_head.inc();
+      held_buffer[stack_head.val] = value;
     } else {
       current = value;
       break;
