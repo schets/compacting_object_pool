@@ -50,6 +50,7 @@ class compacting_pool {
     object_meta *head;
     int occupancy;
 
+    // This is more expensive, but does a better job of preserving the cache
     void free_evict(object_meta *toret) {
         toret->prev = head;
         head->next = toret;
@@ -59,11 +60,17 @@ class compacting_pool {
         }
         else {
             // sentinel->next is the least recently inserted
-            object_meta *toret =
+            object_meta *old_tail = sentinel.next;
+            object_meta *new_tail = old_tail->next;
+            sentinel.next = new_tail;
+            new_tail->prev = &sentinel;
+            // get rid of old_tail;
         }
     }
 
-    // only insert the head if there's
+    // This is cheaper, but doesn't do as good of job of preserving the
+    // recently-usedness of the cache. Probably better for mass freeing if
+    // cpu time spent in the pool is an issue
     void free_noevict(object_meta *toret) {
         if (occupancy < 32) {
             ++occupancy;
